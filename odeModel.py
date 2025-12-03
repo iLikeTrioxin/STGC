@@ -6,7 +6,7 @@ from casadi import SX
 
 # Constants
 GAS_CONSTANT = 8.31446261815324   # ideal gas constant J/mol/K
-
+BAR = 1e5 # Pa
 # geometry (from your hardware; change if needed)
 TUBE_INNER = 0.026         # m (inner diameter)
 TUBE_LENGTH = 0.8             # m total length
@@ -57,10 +57,10 @@ T_amb    = model.set_variable('_tvp', 'T_amb')
 
 # per zone states
 Tw    = model.set_variable('_x', 'Tw'   , (N_ZONES, 1)) # (K) wall temperature
-Tg    = model.set_variable('_x', 'Tg'   , (N_ZONES, 1))     # (K) gas temperature
-C_SO3 = model.set_variable('_x', 'C_SO3', (N_ZONES, 1))  # (mol/m3)
-C_SO2 = model.set_variable('_x', 'C_SO2', (N_ZONES, 1))  # (mol/m3)
-C_O2  = model.set_variable('_x', 'C_O2' , (N_ZONES, 1))    # (mol/m3)
+Tg    = model.set_variable('_x', 'Tg'   , (N_ZONES, 1)) # (K) gas temperature
+C_SO3 = model.set_variable('_x', 'C_SO3', (N_ZONES, 1)) # (mol/m3)
+C_SO2 = model.set_variable('_x', 'C_SO2', (N_ZONES, 1)) # (mol/m3)
+C_O2  = model.set_variable('_x', 'C_O2' , (N_ZONES, 1)) # (mol/m3)
 
 Twa = SX.sym('Twa', N_ZONES)
 Tga = SX.sym('Tga', N_ZONES)
@@ -68,7 +68,7 @@ C_SO3a = SX.sym('C_SO3a', N_ZONES)
 C_SO2a = SX.sym('C_SO2a', N_ZONES)
 C_O2a = SX.sym('C_O2a', N_ZONES)
 
-rate = (A * ca.exp(-E_A / (GAS_CONSTANT * Tg)) * C_SO2) / (C_SO3+1)
+rate = (A * ca.exp(-E_A / (GAS_CONSTANT * Tg)) * C_SO2) / (C_SO3+0.01)
 ADA = AIR_DENSITY_AMBIENT
 ASHC = AIR_SPECIFIC_HEAT_CAPACITY
 GWHT = GAS_WALL_HEAT_TRANSFER
@@ -83,6 +83,8 @@ C_SO2a[1:] = (Fr/ZONE_VOLUMES[1:]) * (C_SO2[0:-1] - C_SO2[1:]) - rate[1:]
 C_O2a [1:] = (Fr/ZONE_VOLUMES[1:]) * (C_O2[0:-1] - C_O2[1:]) - 0.5*rate[1:]
 
 Twa[1:] = (GWHT * (Tg[1:] - Tw[1:]) + 0 - AMBIENT_LOSS * (Tw[1:] - T_amb)) / WHC
+Twa[1:5] = (GWHT * (Tg[1:5] - Tw[1:5]) + Q - AMBIENT_LOSS * (Tw[1:5] - T_amb)) / WHC
+
 Tga[1:] = (Fr / ZONE_VOLUMES[1:]) * (Tg[0:-1] - Tg[1:]) \
         + (-dH_SO3 / (ADA * ASHC)) * rate[1:] \
         + (GWHT / (ADA * ASHC * ZONE_VOLUMES[1:])) * (Tw[1:] - Tg[1:]) \
@@ -108,8 +110,12 @@ model.set_rhs('C_SO2', C_SO2a)
 model.set_rhs('C_O2', C_O2a)
 
 
+model.set_expression(expr_name=f'Q_0', expr=Q[0])
+model.set_expression(expr_name=f'Q_1', expr=Q[1])
+model.set_expression(expr_name=f'Q_2', expr=Q[2])
+model.set_expression(expr_name=f'Q_3', expr=Q[3])
 # expressions
-rmc = molarConc(K_0+25, 1e8)
+rmc = molarConc(K_0+25, 1.5*BAR)
 for i in range(N_ZONES):
     model.set_expression(expr_name=f'Cp_so3_{i}', expr=C_SO3[i]/rmc)
     model.set_expression(expr_name=f'Cp_so2_{i}', expr=C_SO2[i]/rmc)
@@ -117,16 +123,90 @@ for i in range(N_ZONES):
     model.set_expression(expr_name=f'Tgc_{i}', expr=Tg[i]-K_0)
     model.set_expression(expr_name=f'Twc_{i}', expr=Tw[i]-K_0)
 
-
 model.setup()
 print(model._x)
 #estimator = do_mpc.estimator.StateFeedback(model)
+mpc = do_mpc.controller.MPC(model)
+setup_mpc = {
+    'n_horizon': 16,
+    'n_robust': 1,
+    'open_loop': 0,
+    't_step': 0.1,
+    'state_discretization': 'collocation',
+    'collocation_type': 'radau',
+    'collocation_deg': 2,
+    'collocation_ni': 2,
+    'store_full_solution': True,
+    # Use MA27 linear solver in ipopt for faster calculations:
+    'nlpsol_opts': {
+        #'ipopt.linear_solver': 'MA27',
+        'ipopt.max_iter': 500,
+        'ipopt.print_level': 5,
+        'ipopt.tol': 1e-6,
+        'ipopt.constr_viol_tol': 1e-6,
+    }
+}
+
+mpc.set_param(**setup_mpc)
+
+mpc.scaling['_x', 'Tg'] = 100
+mpc.scaling['_x', 'Tw'] = 100
+mpc.scaling['_x', 'C_SO3'] = 100
+mpc.scaling['_x', 'C_SO2'] = 100
+mpc.scaling['_x', 'C_O2'] = 100
+mpc.scaling['_u', 'Q'] = 100
+mpc.scaling['_u', 'FO'] = 1e-5
+mpc.scaling['_u', 'FB'] = 1e-5
+
+_x = model.x
+_u = model.u
+lterm = 4*_x['C_SO2'][-1]**2 + (0.001-_u['FB'])**2 + (0.5-_x['C_SO3'][-1])**2
+mterm = 4*_x['C_SO2'][-1]**2 + (0.5-_x['C_SO3'][-1])**2
+
+mpc.set_objective(mterm=mterm, lterm=lterm)
+
+mpc.set_rterm(FO=0.1, FB=0.1, Q = 1e-3) # input penalty
+
+# states
+mpc.bounds['lower', '_x', 'C_SO3'] = 0.1
+mpc.bounds['lower', '_x', 'C_SO2'] = 0.1
+mpc.bounds['lower', '_x', 'C_O2'] = 0.1
+mpc.bounds['lower', '_x', 'Tg'] = K_0
+mpc.bounds['lower', '_x', 'Tw'] = K_0
+
+mpc.bounds['upper', '_x', 'C_SO3'] = 100
+mpc.bounds['upper', '_x', 'C_SO2'] = 100
+mpc.bounds['upper', '_x', 'C_O2'] = 100
+mpc.bounds['upper', '_x', 'Tg'] = K_0 + 450
+mpc.bounds['upper', '_x', 'Tw'] = K_0 + 450
+
+# input
+mpc.bounds['lower', '_u', 'FO'] = 1e-6
+mpc.bounds['lower', '_u', 'FB'] = 0
+mpc.bounds['lower', '_u', 'Q'] = 0
+
+mpc.bounds['upper', '_u', 'FO'] = 100*1e-6
+mpc.bounds['upper', '_u', 'FO'] = 100*1e-6
+mpc.bounds['upper', '_u', 'Q'] = 10
+
+
+# function for time-varying parameters
+def tvp_fun(t_now):
+    tvp_num = mpc.get_tvp_template()
+    tvp_num['_tvp', :, 'T_in'] = K_0+400
+    tvp_num['_tvp', :, 'T_amb'] = K_0+25
+    return tvp_num
+
+mpc.set_uncertainty_values(C_SO2_in = [molarConc(K_0+25, 1*BAR)*0.1], C_O2_in=[molarConc(K_0+25, 1*BAR)*0.1])
+mpc.set_tvp_fun(tvp_fun)
+
+estimator = do_mpc.estimator.StateFeedback(model)
 simulator = do_mpc.simulator.Simulator(model)
 params_simulator = {
     'integration_tool': 'cvodes',
     'abstol': 1e-10,
     'reltol': 1e-10,
-    't_step': 0.05,
+    't_step': 0.1,
 }
 
 simulator.set_param(**params_simulator)
@@ -141,14 +221,15 @@ def tvp_fun(t_now):
     return tvp_num
 
 # uncertain parameters
-p_num['C_SO2_in'] = molarConc(K_0+25, 1e8)*0.1
-p_num['C_O2_in'] = molarConc(K_0+25, 1e8)*0.1
+p_num['C_SO2_in'] = molarConc(K_0+25, 1.5*BAR)*0.1
+p_num['C_O2_in'] = molarConc(K_0+25, 1.5*BAR)*0.1
 def p_fun(t_now):
     return p_num
 
 simulator.set_tvp_fun(tvp_fun)
 simulator.set_p_fun(p_fun)
 
+mpc.setup()
 simulator.setup()
 
 u0 = [
@@ -159,17 +240,23 @@ u0 = [
 x0 = []
 x0 += [K_0+400.0 for i in range(N_ZONES)] # (K) wall temperature
 x0 += [K_0+400.0 for i in range(N_ZONES)] # (K) gas temperature
-x0 += [molarConc(K_0+25, 1e8)*0.0 for i in range(N_ZONES)] # (mol/m3)
-x0 += [molarConc(K_0+25, 1e8)*0.1 for i in range(N_ZONES)] # (mol/m3)
-x0 += [molarConc(K_0+25, 1e8)*0.1 for i in range(N_ZONES)]  # (mol/m3)
+x0 += [molarConc(K_0+25, 1.5*BAR)*0.0 for i in range(N_ZONES)] # (mol/m3)
+x0 += [molarConc(K_0+25, 1.5*BAR)*0.0 for i in range(N_ZONES)] # (mol/m3)
+x0 += [molarConc(K_0+25, 1.5*BAR)*0.1 for i in range(N_ZONES)]  # (mol/m3)
 
 u0 = np.array(u0).reshape(-1,1)
 x0 = np.array(x0).reshape(-1,1)
 
+mpc.x0 = x0
 simulator.x0 = x0
+estimator.x0 = x0
+
+mpc.set_initial_guess()
 
 for k in range(200):
+    u0 = mpc.make_step(x0)
     y_next = simulator.make_step(u0)
+    x0 = estimator.make_step(y_next)
 
 mpc_graphics = do_mpc.graphics.Graphics(simulator.data)
 
@@ -178,9 +265,21 @@ from matplotlib import rcParams
 rcParams['axes.grid'] = True
 rcParams['font.size'] = 18
 
-fig, ax = plt.subplots(nrows=N_ZONES, ncols=2, sharex=True, figsize=(14,10))
+fig, ax = plt.subplots(nrows=N_ZONES, ncols=3, sharex=True, figsize=(14,10))
 
 plt.tight_layout()
+mpc_graphics.add_line(var_type='_u', var_name=f'FO', axis=ax[0][2], label='FO')
+mpc_graphics.add_line(var_type='_aux', var_name=f'Q_0', axis=ax[1][2], label='Q1')
+mpc_graphics.add_line(var_type='_aux', var_name=f'Q_1', axis=ax[2][2], label='Q2')
+mpc_graphics.add_line(var_type='_aux', var_name=f'Q_2', axis=ax[3][2], label='Q3')
+mpc_graphics.add_line(var_type='_aux', var_name=f'Q_3', axis=ax[4][2], label='Q4')
+mpc_graphics.add_line(var_type='_u', var_name=f'FB', axis=ax[5][2], label='FB')
+ax[0][2].legend()
+ax[1][2].legend()
+ax[2][2].legend()
+ax[3][2].legend()
+ax[4][2].legend()
+ax[5][2].legend()
 for i in range(N_ZONES):
     mpc_graphics.add_line(var_type='_aux', var_name=f'Cp_so3_{i}', axis=ax[i][0], label='SO3')
     mpc_graphics.add_line(var_type='_aux', var_name=f'Cp_so2_{i}', axis=ax[i][0], label='SO2')
@@ -188,6 +287,7 @@ for i in range(N_ZONES):
 
     mpc_graphics.add_line(var_type='_aux', var_name=f'Tgc_{i}', axis=ax[i][1], label='Tgas')
     mpc_graphics.add_line(var_type='_aux', var_name=f'Twc_{i}', axis=ax[i][1], label='Twall')
+    
     #label_lines  = mpc_graphics.result_lines['_aux', f'Cp_so3']
     #label_lines += mpc_graphics.result_lines['_aux', f'Cp_so2']
     #label_lines += mpc_graphics.result_lines['_aux', f'Cp_o2']
